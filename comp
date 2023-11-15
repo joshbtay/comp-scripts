@@ -1,0 +1,326 @@
+#!/bin/python
+from curses import *
+import _curses
+from math import *
+from sys import argv
+from time import time
+from window_utils.draw import *
+from window_utils.progressbar import *
+from window_utils.timebar import *
+from window_utils.boxframe import *
+from window_utils.options import *
+from window_utils.textbox import *
+from queue import Queue, Empty
+from threading import Thread
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import os
+from subprocess import *
+
+os.chdir("/home/taylor/code/comp-scripts/")
+
+class FileModifiedHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        global edited, last_used
+        edited = True
+        last_used = event.src_path.split('.')[-1]
+
+#Usage: ./comp [kattis|codeforces|adventofcode] base_url [problemID|contestID] -c
+state = "start"
+platform = argv[1]
+base_url = argv[2]
+id = argv[3]
+scr = lambda x:x
+rows = cols = 0
+start,end=-2,-1
+edited = False
+timebox=lambda x:x
+timebar=lambda x:x
+observer = Observer()
+event_handler = FileModifiedHandler()
+scheduled = set()
+
+def check_screen():
+    global rows, cols, scr
+    r,c = scr.getmaxyx()
+    if (rows, cols) != (r, c):
+        scr.clear()
+        rows, cols = r, c
+        return True
+    return False
+
+def contest_info():
+    info_script = "web-scripts/" + platform + "_contest_info"
+    lines = check_output([info_script, base_url, id]).decode('utf-8').strip().split('\n')
+    if len(lines) == 1:
+        raise Exception(lines[0])
+    if len(lines) == 2:
+        state = "waiting"
+        t = begin_wait = time()
+        start = int(lines[0])
+        bar = TimeBar(draw, scr, lambda x: 2, lambda y: 1, lambda x: x-3, lambda y: y, "green", begin_wait, start)
+        box = BoxFrame(draw, scr, lambda x: 0, 0, lambda x: x, lambda y: 3, "green", subtitle="Waiting for contest to start...")
+        while t < start:
+            check_screen()
+            t=time()
+            bar.set_ratio((t - begin_wait) / (start - begin_wait))
+            box.set_ratio((t - begin_wait) / (0.4))
+            scr.refresh()
+        lines = check_output([info_script, argv[2], argv[3]]).decode('utf-8').strip().split('\n')
+        scr.clear()
+    return lines
+
+def watch(file):
+    if file in scheduled:
+        return
+    observer.schedule(event_handler,file)
+    scheduled.add(file)
+
+def enqueue_output(out, queue):
+    for line in iter(out.readline, b''):
+        queue.put(line)
+    out.close()
+
+def testcases(directory):
+    inputs = []
+    answers = []
+    for path in os.listdir(directory):
+        if path.endswith(".in"):
+            watch(directory+path)
+            inputs.append(path)
+        elif path.endswith(".ans"):
+            watch(directory+path)
+            answers.append(path)
+    inputs.sort()
+    answers.sort()
+    return inputs,answers
+
+
+
+
+def contest():
+    global timebox, timebar, start, end
+    if "contest_info" in cache:
+        info = cache["contest_info"]
+    else:
+        info = contest_info()
+        cache["contest_info"] = info
+    assert len(info) > 2
+    start,end = map(int,info[:2])
+    info = info[2:]
+    n=len(info)
+    download_script = "web-scripts/" + platform + "_downloader"
+    begin_wait = time()
+    downloaders = [Popen([download_script, base_url, problemid], stdout=PIPE, stderr=PIPE,text=True) for problemid in info]
+    timebar = TimeBar(draw, scr, 2, lambda y: y-3, lambda x: x-3, 1, "cyan", start, end)
+    timebar.set_visible(len(info)>1)
+    timebar.done_string = " contest over."
+    timebox = BoxFrame(draw, scr, 0, lambda y: y-4, lambda x:x, 3, "cyan", subtitle="time remaining")
+    timebox.set_visible(len(info)>1)
+    bars = [ProgressBar(draw, scr, 2, i*3+1, lambda x: x-3, 1, "green", "downloading") for i in range(n)]
+    zipbars = [ProgressBar(draw, scr, 2, i*3+1, lambda x: x-3, 1, "cyan", "unzipping") for i in range(n)]
+    letters = {chr(ord('a')+i):info[i] for i in range(n)}
+    boxes = [BoxFrame(draw, scr, 0, i*3, lambda x: x, 3, "green", title=f"[{chr(ord('a')+i)}]:",subtitle=info[i]) for i in range(n)]
+    completed = [0]*n
+    qs = [Queue() for _ in range(n)]
+    ts = [Thread(target=enqueue_output, args=(downloaders[i].stdout, qs[i])) for i in range(n)]
+    for t in ts:
+        t.daemon = True
+        t.start()
+    while True:
+        redraw = check_screen()
+        t=time()
+        for i in range(len(boxes)):
+            boxes[i].set_ratio((t - begin_wait) / (.4) - (0.2*i))
+            bars[i].set_ratio(max(min((t-begin_wait) / (2), 0.5), bars[i].ratio))
+            if completed[i]==1:
+                zipbars[i].set_ratio(max((t-begin_wait) / (3), bars[i].ratio))
+            try:
+                line = qs[i].get_nowait().strip()
+                if line == '': continue
+                elif line == "no zip":
+                    bars[i].done_string = " no test cases."
+                    bars[i].set_color("yellow")
+                    bars[i].set_ratio(1.1)
+                    boxes[i].set_color("yellow")
+                    completed[i]=2
+                    zipbars[i].visible = False
+                elif line == "downloaded":
+                    completed[i]=1
+                    bars[i].set_ratio(1.1)
+                    boxes[i].set_color(zipbars[i].color)
+                    boxes[i].redraw()
+                elif line == "unzipped":
+                    completed[i]=2
+                    zipbars[i].set_ratio(1.1)
+                else:
+                    f = float(line)
+                    if completed[i]==0:
+                        bars[i].set_ratio(f)
+                    else:
+                        zipbars[i].set_ratio(f)
+            except Empty:
+                pass
+        key = scr.getch()
+        if key != -1:
+            if ord('a') <= key <= ord('z') or ord('A') <= key <= ord('Z'):
+                c = chr(key).lower()
+                if c=="q":
+                    quit()
+                if c in letters:
+                    key=-1
+                    problem(letters[c])
+                    scr.clear()
+                    redraw=True
+        if redraw:
+            for bar in bars:
+                bar.redraw()
+            for bar in zipbars:
+                bar.redraw()
+            for box in boxes:
+                box.redraw()
+            timebox.redraw()
+            timebar.redraw()
+        if t > end:
+            timebar.set_color("blue")
+        timebar.set_ratio((t-start)/(end-start))
+        timebox.set_ratio((t-begin_wait) / (.4) - (0.4*n))
+        if len(info) == 1 and bars[0].done and zipbars[0].done:
+            problem(info[0])
+        scr.refresh()
+
+
+def problem(problem_id):
+    global last_used, edited, observer, scheduled
+    scr.clear()
+    if timebox.visible:
+        timebox.set_ratio(1.1)
+        timebox.redraw()
+        timebar.redraw()
+    options = {'c':"++", 'p':"y","v":"iew","r":"un","a":"ll","s":"ubmit", "t":"erm", "b":"ack", "q":"uit"}
+    problem_dir = f"/home/taylor/code/{platform}/{problem_id}/"
+    observer = Observer()
+    scheduled=set()
+    watch(problem_dir+"run.cpp")
+    watch(problem_dir+"run.py")
+    observer.start()
+    option = Options(draw, scr, 1, lambda y:y-1, lambda x: x, 1, "white", options)
+    confirm = 0
+    confirm_option = Options(draw, scr, lambda x:(x-30)//4+25, lambda y:y-subtract, lambda x: (x-30)//2, 1, "white", {'y':'es', 'n':'o'})
+    last_used = "cpp"
+    subtract = 5 if timebox.visible else 2
+    problem_box = BoxFrame(draw, scr, 0, 0, lambda x:x, lambda y:y-subtract, "cyan", footer="problem: "+problem_id)
+    problem_box.visible=False
+    textbox = TextBox(draw, scr, 2, 1, lambda x:x-4, lambda y:y-subtract-2, "default", "no test cases found.")
+    inputs,answers = testcases(problem_dir)
+    if inputs:
+        textbox.set_text(open(problem_dir+inputs[0]).read())
+        problem_box.set_title(inputs[0])
+        option.last_selected = 'v'
+    dual_boxes = [
+        BoxFrame(draw, scr, 0, 0, lambda x:x//2, lambda y:y-subtract, "cyan"),
+        BoxFrame(draw, scr, lambda x:x//2, 0, lambda x:x//2, lambda y:y-subtract, "cyan", footer="problem: "+problem_id)
+    ]
+    dual_text = [
+        TextBox(draw,scr,2, 1, lambda x:x//2-4, lambda y:y-subtract-2, "default", "output"*99),
+        TextBox(draw,scr,lambda x: x//2+2, 1, lambda x:x//2-4, lambda y:y-subtract-2, "default", "answer"*99)
+    ]
+    
+    solve_time = time()
+    vr = 0
+    while True:
+        t=time()
+        redraw = check_screen()
+        key = scr.getch()
+        if edited:
+            edited = False
+        if key != -1:
+            if key==ord('c') or key==ord('C'):
+                Popen(["alacritty", "--working-directory", problem_dir,  "-e", "/usr/bin/nvim", "+18", "run.cpp"],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+                last_used = "cpp"
+                option.select('c')
+            elif key==ord('p') or key==ord('P'):
+                Popen(["alacritty", "--working-directory", problem_dir,  "-e", "/usr/bin/nvim", "+1000", "run.py"],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+                last_used = "py"
+                option.select('p')
+            elif key==ord('s') or key==ord('S'):
+                option.select('s')
+                confirm = inf
+            elif key==ord('r') or key==ord('R'):
+                option.select('r')
+            elif key==ord('a') or key==ord('A'):
+                option.select('a')
+            elif key==ord('t') or key==ord('T'):
+                Popen(["alacritty", "--working-directory", problem_dir, "-e", "/usr/bin/zsh"], stdout=open('/dev/null', 'w'), stderr=open('/dev/null','w'), preexec_fn=os.setpgrp)
+                option.select('t')
+            elif key==ord('q') or key==ord('Q'):
+                quit()
+            elif key==ord('b') or key==ord('B'):
+                break
+            elif key==ord('v') or key==ord('V'):
+                inputs, answers = testcases(problem_dir)
+                if option.last_selected == 'v':
+                    vr +=1
+                option.select('v')
+                scr.clear()
+                redraw=True
+                problem_box.set_visible(True)
+                textbox.set_visible(True)
+                if inputs:
+                    textbox.set_text(open(problem_dir+inputs[vr%len(inputs)]).read())
+                    problem_box.set_title(inputs[vr%len(inputs)])
+
+            elif confirm and (key == ord('y') or key == ord('Y')):
+                confirm_option.select('y')
+                confirm = t
+                Popen([f"web-scripts/{platform}_submit", f"{problem_dir}/run.{last_used}", "-p", problem_id, "-f"], stderr=open('/dev/null', 'w'), stdout=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+            elif confirm and (key == ord('n') or key == ord('N')):
+                confirm_option.select('n')
+                confirm = t
+        if not problem_box.visible:
+            for i in range(2):
+                dual_boxes[i].set_ratio((t-solve_time)/0.4-i*0.4)
+                dual_text[i].update()
+        else:
+            problem_box.set_ratio((t-solve_time)/0.4)
+            textbox.update()
+        option.update()
+        if confirm:
+            confirm_option.update()
+            draw.drawstring(rows-subtract, 1, "would you like to submit?", "white", italic=True)
+            if t - confirm > .2:
+                confirm = 0
+                redraw = True
+        if redraw:
+            scr.clear()
+            if timebar.visible:
+                timebar.redraw()
+                timebox.redraw()
+            if problem_box.visible:
+                problem_box.redraw()
+                textbox.redraw()
+            else:
+                for i in range(2):
+                    dual_boxes[i].redraw()
+                    dual_text[i].redraw()
+
+        scr.refresh()
+
+def main(screen):
+    global state, scr, rows, cols, draw, cache
+    cache = {}
+    scr = screen
+    #setup
+    scr.clear()
+    scr.scrollok(False)
+    use_default_colors()
+    curs_set(0)
+    screen.nodelay(1)
+    rows, cols = scr.getmaxyx()
+    draw = Draw(scr)
+    competition = "-c" in argv
+    if not competition:
+        cache["contest_info"] = ["1", "2", id]
+    contest()
+
+wrapper(main)

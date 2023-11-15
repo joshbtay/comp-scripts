@@ -1,0 +1,42 @@
+#!/bin/python
+from sys import argv
+from time import sleep
+import pytz
+import tzlocal
+import requests
+from bs4 import BeautifulSoup as bs
+from datetime import datetime
+#Usage: kattis_contest_info base_url contest_id
+
+base_url = argv[1]
+contest_id = argv[2]
+url = base_url + "/contests/" + contest_id
+response = requests.get(url)
+
+
+def get_time(time):
+    date = " ".join(time.split()[:2])
+    tz = pytz.timezone(time.split()[-1])
+    localized = tz.localize(datetime.strptime(date, "%Y-%m-%d %H:%M"))
+    return int(localized.timestamp())
+
+if response.status_code == 200:
+    html_content = response.text
+    soup = bs(html_content, 'html.parser')
+    start_time = soup.find(string="Start Time").parent.parent.contents[3].text.strip()
+    end_time = soup.find(string="End time").parent.parent.contents[3].text.strip()
+    start = get_time(start_time)
+    end = get_time(end_time)
+    print(start)
+    print(end)
+    if start < datetime.now().timestamp():
+        table = soup.find(string="Label").parent.parent.parent.parent.findAll("a")
+        problems = []
+        for i in range(len(table)):
+            if i%2:
+                table[i].attrs["href"].split('/')[-1]
+                problems.append(table[i].attrs["href"].split('/')[-1])
+
+        print('\n'.join(problems))
+else:
+    print("error",response.status_code)

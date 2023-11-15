@@ -1,0 +1,87 @@
+#!/bin/python
+import os
+from sys import argv
+from zipfile import ZipFile
+import requests
+from pathlib import Path
+
+
+#Usage: ./kattis_downloader base_url problemid
+base_url = argv[1]
+problemid = argv[2]
+zipurl = base_url + f"/problems/{problemid}/file/statement/samples.zip"
+
+platdir = "/home/taylor/code/kattis/"+problemid
+def extract(zip_path, target_path):
+    zf = ZipFile(zip_path)
+    l = zf.infolist()
+    size = sum(f.file_size for f in l)
+    total = 0
+    count = 0
+    namemap = {}
+    for fileinfo in sorted(l, key=lambda k: k.filename):
+        print(total/size)
+        name = fileinfo.filename
+        prefix = name.rstrip(".in").rstrip(".ans")
+        suffix = "." + name.split('.')[-1]
+        total += fileinfo.file_size
+        if prefix in namemap:
+            px = namemap[prefix]
+        else:
+            px = str(count)
+            namemap[prefix] = px
+            count += 1
+        zf.extract(fileinfo, target_path)
+        os.rename(target_path+"/"+name, target_path+"/"+px+suffix)
+    os.remove(zip_path)
+    print(1.0)
+    print("unzipped")
+    return True
+
+def download(target_path):
+    print(0.0)
+    with open(target_path, "wb") as f:
+        response = requests.get(zipurl, stream=True)
+        if response.status_code == 404:
+            print("no zip")
+            return False
+        total_length = response.headers.get('content-length')
+        if total_length is None:
+            f.write(response.content)
+        else:
+            dl = 0
+            total_length = int(total_length)
+            for data in response.iter_content(chunk_size=1024):
+                dl += len(data)
+                print(dl/total_length)
+                f.write(data)
+    print(1.0)
+    print("downloaded")
+    return True
+
+
+if not os.path.isdir(platdir):
+    os.makedirs(platdir)
+if not os.path.isfile(platdir+"/run.py"):
+    f=open("/home/taylor/code/comp-scripts/templates/base.py")
+    out = open(platdir + "/run.py", "w")
+    out.write(f.read())
+if not os.path.isfile(platdir+"/run.cpp"):
+    f = open("/home/taylor/code/comp-scripts/templates/base.cpp")
+    out = open(platdir + "/run.cpp", "w")
+    out.write(f.read())
+    
+if len(list(filter(lambda x: x.endswith(".in"), os.listdir(platdir)))) > 0:
+    print(0.0)
+    print(1.0)
+    print("downloaded")
+    print(0.0)
+    print(1.0)
+    print("unzipped")
+    quit()
+
+fname = platdir+"/samples.zip"
+
+if download(fname):
+    extract(fname, platdir)
+
