@@ -11,4 +11,4 @@ class TimeBar(Bar):
         if self.done:
             return self.done_string
         t = self.end_time - time()
-        return f"   {int(t//3600):02}:{int(t//60):02}:{int(t*10%600)/10}"
+        return f"   {int(t//3600):02}:{int(t//60%60):02}:{int(t*10%600)/10}"

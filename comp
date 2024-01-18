@@ -1,44 +1,41 @@
 #!/bin/python
 from curses import *
-import _curses
 from math import *
 from sys import argv
-from time import time
+from time import time, sleep
 from window_utils.draw import *
 from window_utils.progressbar import *
 from window_utils.timebar import *
 from window_utils.boxframe import *
 from window_utils.options import *
 from window_utils.textbox import *
+from io_utils.diffcheck import *
 from queue import Queue, Empty
 from threading import Thread
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 import os
 from subprocess import *
 
-os.chdir("/home/taylor/code/comp-scripts/")
-
-class FileModifiedHandler(FileSystemEventHandler):
-    def on_modified(self, event):
-        global edited, last_used
-        edited = True
-        last_used = event.src_path.split('.')[-1]
-
 #Usage: ./comp [kattis|codeforces|adventofcode] base_url [problemID|contestID] -c
 state = "start"
+auto_submit = '--no-confirm' in argv
+no_term = '--no-term' in argv
 platform = argv[1]
 base_url = argv[2]
 id = argv[3]
+pid = str(os.getppid())
 scr = lambda x:x
 rows = cols = 0
 start,end=-2,-1
 edited = False
 timebox=lambda x:x
 timebar=lambda x:x
-observer = Observer()
-event_handler = FileModifiedHandler()
-scheduled = set()
+script_path = os.path.dirname(os.path.realpath(__file__))+"/"
+running_procs = {}
+draw = lambda:0
+cache = {}
+compiling = False
+view_state = ""
+problem_id = ''
 
 def check_screen():
     global rows, cols, scr
@@ -50,7 +47,7 @@ def check_screen():
     return False
 
 def contest_info():
-    info_script = "web-scripts/" + platform + "_contest_info"
+    info_script = script_path+"web-scripts/" + platform + "_contest_info"
     lines = check_output([info_script, base_url, id]).decode('utf-8').strip().split('\n')
     if len(lines) == 1:
         raise Exception(lines[0])
@@ -58,7 +55,7 @@ def contest_info():
         state = "waiting"
         t = begin_wait = time()
         start = int(lines[0])
-        bar = TimeBar(draw, scr, lambda x: 2, lambda y: 1, lambda x: x-3, lambda y: y, "green", begin_wait, start)
+        bar = TimeBar(draw, scr, lambda x: 2, lambda y: 1, lambda x: x-3, lambda y: 1, "green", begin_wait, start)
         box = BoxFrame(draw, scr, lambda x: 0, 0, lambda x: x, lambda y: 3, "green", subtitle="Waiting for contest to start...")
         while t < start:
             check_screen()
@@ -70,15 +67,12 @@ def contest_info():
         scr.clear()
     return lines
 
-def watch(file):
-    if file in scheduled:
-        return
-    observer.schedule(event_handler,file)
-    scheduled.add(file)
-
-def enqueue_output(out, queue):
+def enqueue_output(out, queue, pid):
     for line in iter(out.readline, b''):
-        queue.put(line)
+        if line:
+            queue.put(line)
+        if not running_procs[pid]:
+            break
     out.close()
 
 def testcases(directory):
@@ -86,16 +80,12 @@ def testcases(directory):
     answers = []
     for path in os.listdir(directory):
         if path.endswith(".in"):
-            watch(directory+path)
             inputs.append(path)
         elif path.endswith(".ans"):
-            watch(directory+path)
             answers.append(path)
     inputs.sort()
     answers.sort()
     return inputs,answers
-
-
 
 
 def contest():
@@ -109,7 +99,7 @@ def contest():
     start,end = map(int,info[:2])
     info = info[2:]
     n=len(info)
-    download_script = "web-scripts/" + platform + "_downloader"
+    download_script = script_path + "web-scripts/" + platform + "_downloader"
     begin_wait = time()
     downloaders = [Popen([download_script, base_url, problemid], stdout=PIPE, stderr=PIPE,text=True) for problemid in info]
     timebar = TimeBar(draw, scr, 2, lambda y: y-3, lambda x: x-3, 1, "cyan", start, end)
@@ -123,22 +113,24 @@ def contest():
     boxes = [BoxFrame(draw, scr, 0, i*3, lambda x: x, 3, "green", title=f"[{chr(ord('a')+i)}]:",subtitle=info[i]) for i in range(n)]
     completed = [0]*n
     qs = [Queue() for _ in range(n)]
-    ts = [Thread(target=enqueue_output, args=(downloaders[i].stdout, qs[i])) for i in range(n)]
-    for t in ts:
-        t.daemon = True
-        t.start()
+    ts = [Thread(target=enqueue_output, args=(downloaders[i].stdout, qs[i], f"{i}_downloader")) for i in range(n)]
+    for i in range(n):
+        running_procs[f"{i}_downloader"] = True
+        ts[i].setDaemon(True)
+        ts[i].start()
     while True:
         redraw = check_screen()
         t=time()
         for i in range(len(boxes)):
+            if downloaders[i].poll() is not None:
+                running_procs[f"{i}_downloader"] = False
             boxes[i].set_ratio((t - begin_wait) / (.4) - (0.2*i))
             bars[i].set_ratio(max(min((t-begin_wait) / (2), 0.5), bars[i].ratio))
             if completed[i]==1:
                 zipbars[i].set_ratio(max((t-begin_wait) / (3), bars[i].ratio))
             try:
                 line = qs[i].get_nowait().strip()
-                if line == '': continue
-                elif line == "no zip":
+                if line == "no zip":
                     bars[i].done_string = " no test cases."
                     bars[i].set_color("yellow")
                     bars[i].set_ratio(1.1)
@@ -190,27 +182,61 @@ def contest():
         scr.refresh()
 
 
-def problem(problem_id):
-    global last_used, edited, observer, scheduled
+def run_inputs(directory):
+    inputs,answers = testcases(directory)
+    processes = []
+    input_names = []
+    for inputfile in inputs:
+        input_name = inputfile.rstrip('.in')
+        outputfile = directory + input_name + ".out"
+        if last_used == "py":
+            processes.append(f"Popen(['pypy3', '{directory}run.py'], stdin=open('{directory}{inputfile}'), stdout = open('{outputfile}', 'w'), stderr=PIPE, text=True, preexec_fn=os.setpgrp)")
+        elif last_used == 'cpp':
+            processes.append(f"Popen(['{directory}run'], stdin=open('{directory}{inputfile}'), stdout = open('{outputfile}', 'w'), stderr=PIPE, text=True, preexec_fn=os.setpgrp)")
+        input_names.append(input_name)
+
+    return processes, input_names
+
+def file_watch(dir):
+    global edited, last_used, view_state, compiling
+    id = problem_id
+    lm = {'py': os.path.getmtime(dir+"run.py"), 'cpp':os.path.getmtime(dir+"run.cpp")}
+    while True:
+        if id != problem_id:
+            break
+        for suffix, value in lm.items():
+            t = os.path.getmtime(dir+"run."+suffix)
+            if t != value:
+                view_state = "running"
+                lm[suffix] = t
+                last_used = suffix
+                edited = True
+                if suffix == "cpp":
+                    compiling = True
+        sleep(0.1)
+
+
+
+
+def problem(id):
+    global last_used, edited, view_state, problem_id, compiling, auto_submit
+    problem_id = id
     scr.clear()
     if timebox.visible:
         timebox.set_ratio(1.1)
         timebox.redraw()
         timebar.redraw()
-    options = {'c':"++", 'p':"y","v":"iew","r":"un","a":"ll","s":"ubmit", "t":"erm", "b":"ack", "q":"uit"}
+    options = {'c':"++", 'p':"y","v":"iew","r":"un","a":"ll","s":"ubmit", "t":"erm","i":"de", "b":"ack", "q":"uit"}
     problem_dir = f"/home/taylor/code/{platform}/{problem_id}/"
-    observer = Observer()
-    scheduled=set()
-    watch(problem_dir+"run.cpp")
-    watch(problem_dir+"run.py")
-    observer.start()
+    watcher = Thread(target=file_watch, args=[problem_dir])
+    watcher.daemon=True
+    watcher.start()
     option = Options(draw, scr, 1, lambda y:y-1, lambda x: x, 1, "white", options)
     confirm = 0
     confirm_option = Options(draw, scr, lambda x:(x-30)//4+25, lambda y:y-subtract, lambda x: (x-30)//2, 1, "white", {'y':'es', 'n':'o'})
-    last_used = "cpp"
+    last_used = "py"
     subtract = 5 if timebox.visible else 2
     problem_box = BoxFrame(draw, scr, 0, 0, lambda x:x, lambda y:y-subtract, "cyan", footer="problem: "+problem_id)
-    problem_box.visible=False
     textbox = TextBox(draw, scr, 2, 1, lambda x:x-4, lambda y:y-subtract-2, "default", "no test cases found.")
     inputs,answers = testcases(problem_dir)
     if inputs:
@@ -219,21 +245,53 @@ def problem(problem_id):
         option.last_selected = 'v'
     dual_boxes = [
         BoxFrame(draw, scr, 0, 0, lambda x:x//2, lambda y:y-subtract, "cyan"),
-        BoxFrame(draw, scr, lambda x:x//2, 0, lambda x:x//2, lambda y:y-subtract, "cyan", footer="problem: "+problem_id)
+        BoxFrame(draw, scr, lambda x:x//2, 0, lambda x:x-x//2, lambda y:y-subtract, "cyan", footer="problem: "+problem_id)
     ]
     dual_text = [
-        TextBox(draw,scr,2, 1, lambda x:x//2-4, lambda y:y-subtract-2, "default", "output"*99),
-        TextBox(draw,scr,lambda x: x//2+2, 1, lambda x:x//2-4, lambda y:y-subtract-2, "default", "answer"*99)
+        TextBox(draw,scr,2, 1, lambda x:x//2-4, lambda y:y-subtract-2, "default", ""),
+        TextBox(draw,scr,lambda x: x//2+2, 1, lambda x:(x-x//2)-4, lambda y:y-subtract-2, "default", "")
     ]
+    run_processes = []
+    run_times = []
+    run_status = []
+    input_names = []
+    run_diffs = []
+    j = 0
+    edits = 0
+    change_view_state = False
+    compiler = None
+    compile_error = ""
+    compiling = False
     
     solve_time = time()
     vr = 0
+    dr = 0
+    view_state = "input"
+    if auto_submit and not no_term:
+        Popen(["alacritty", "--working-directory", problem_dir,  "-e", "/usr/bin/nvim", "+1000", "run.py"],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+        option.select('p')
+    if auto_submit:
+        last_used = "py"
     while True:
         t=time()
         redraw = check_screen()
         key = scr.getch()
         if edited:
+            for process in run_processes:
+                if process is not None and not isinstance(process, str):
+                    process.terminate()
+            run_processes, input_names = run_inputs(problem_dir)
+            run_times = [0.0]*len(run_processes)
+            run_status = ["queued"]*len(run_processes)
+            run_diffs = [None]*len(run_processes)
+            change_view_state = True
             edited = False
+            if compiling:
+                if compiler is not None:
+                    compiler.terminate()
+                compiler = Popen(["g++", "-g", "-O2", "-std=gnu++17", "-static", "-o", problem_dir+"run", "-lrt", "-Wl,--whole-archive", "-lpthread", "-Wl,--no-whole-archive", problem_dir+"run.cpp"], text=True, stderr=PIPE)
+            j = 0
+            edits +=1
         if key != -1:
             if key==ord('c') or key==ord('C'):
                 Popen(["alacritty", "--working-directory", problem_dir,  "-e", "/usr/bin/nvim", "+18", "run.cpp"],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
@@ -243,13 +301,30 @@ def problem(problem_id):
                 Popen(["alacritty", "--working-directory", problem_dir,  "-e", "/usr/bin/nvim", "+1000", "run.py"],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
                 last_used = "py"
                 option.select('p')
+            elif key==ord('i') or key==ord('I'):
+                Popen(["code", problem_dir+"/run."+last_used, "--folder-uri", problem_dir],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+                last_used = "py"
+                option.select('p')
             elif key==ord('s') or key==ord('S'):
                 option.select('s')
                 confirm = inf
             elif key==ord('r') or key==ord('R'):
+                if not edits:
+                    edited = True
+                if option.last_selected == 'r':
+                    dr += 1
+                else:
+                    dr = 0
                 option.select('r')
+                view_state = "diff"
+                change_view_state = True
+                redraw = True
             elif key==ord('a') or key==ord('A'):
+                if option.last_selected == 'a' or not edits:
+                    edited = True
                 option.select('a')
+                view_state = "running"
+                change_view_state = True
             elif key==ord('t') or key==ord('T'):
                 Popen(["alacritty", "--working-directory", problem_dir, "-e", "/usr/bin/zsh"], stdout=open('/dev/null', 'w'), stderr=open('/dev/null','w'), preexec_fn=os.setpgrp)
                 option.select('t')
@@ -261,29 +336,143 @@ def problem(problem_id):
                 inputs, answers = testcases(problem_dir)
                 if option.last_selected == 'v':
                     vr +=1
+                else:
+                    vr = 0
                 option.select('v')
                 scr.clear()
                 redraw=True
-                problem_box.set_visible(True)
-                textbox.set_visible(True)
+                view_state = "input"
                 if inputs:
                     textbox.set_text(open(problem_dir+inputs[vr%len(inputs)]).read())
                     problem_box.set_title(inputs[vr%len(inputs)])
-
+            elif ord('0') <= key <= ord('9'):
+                if not edits:
+                    edited = True
+                dr = key - ord('0')
+                option.select('r')
+                view_state = "diff"
+                change_view_state = True
+                redraw = True
             elif confirm and (key == ord('y') or key == ord('Y')):
                 confirm_option.select('y')
                 confirm = t
-                Popen([f"web-scripts/{platform}_submit", f"{problem_dir}/run.{last_used}", "-p", problem_id, "-f"], stderr=open('/dev/null', 'w'), stdout=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+                Popen([script_path + f"web-scripts/{platform}_submit", f"{problem_dir}/run.{last_used}", problem_id, base_url, pid], stderr=open('/dev/null', 'w'), stdout=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
             elif confirm and (key == ord('n') or key == ord('N')):
                 confirm_option.select('n')
                 confirm = t
-        if not problem_box.visible:
-            for i in range(2):
-                dual_boxes[i].set_ratio((t-solve_time)/0.4-i*0.4)
-                dual_text[i].update()
-        else:
+        if confirm and auto_submit:
+            Popen([script_path + f"web-scripts/{platform}_submit", f"{problem_dir}/run.{last_used}", problem_id, base_url, pid], stderr=open('/dev/null', 'w'), stdout=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+            auto_submit = False
+            confirm_option.select('y')
+            confirm = t
+
+        status_change = False
+
+        if compiling:
+            p = compiler.poll()
+            if p is not None:
+                compiling = False
+                if p != 0:
+                    run_processes = []
+                    compile_error = compiler.stderr.read()
+                else:
+                    compile_error = ""
+                compiler = None
+                change_view_state = True
+
+        if j < len(run_processes) and not compiling:
+            p=run_processes[j]
+            if isinstance(p, str):
+                run_processes[j] = eval(p)
+                run_status[j] = "\\<cyan_>running\\<clear>"
+                p = run_processes[j]
+                run_times[j] = time()
+                status_change = True
+            exit_code = p.poll()
+            if exit_code is not None:
+                run_times[j] = time() - run_times[j]
+                if exit_code == 0:
+                    status, left, right = evaluate_output(problem_dir, input_names[j]) if platform != 'aoc' else evaluate_last_line(problem_dir, input_names[j])
+                    run_status[j] = status + " " + "\\<itali>\\<dim__>"+str(round(run_times[j], 2))+" s\\<clear>"
+                    run_diffs[j] = (left, right)
+                else:
+                    run_status[j] = "\\<magen>\\<bold_>run time error\\<clear>"
+                    _,error = p.communicate()
+                    run_diffs[j] = error
+                run_processes[j]=None
+                j+=1
+                status_change = True
+            elif (time() - run_times[j] > 2 and not auto_submit):
+                run_processes[j].kill()
+                run_processes[j] = None
+                run_diffs[j] = "Time Limit Exceeded"
+                run_times[j] = time() - run_times[j]
+                run_status[j] = "\\<yello>\\<bold_>time limit exceeded\\<clear>"
+                j+=1
+                status_change = True
+            if j == len(run_processes):
+                if all("no solution" in line or "passed" in line for line in run_status) and run_processes:
+                    confirm = inf
+
+        if view_state == "diff":
+            if last_used == "cpp" and compile_error and not compiling:
+                view_state = "running"
+                change_view_state = True
+            if change_view_state or status_change:
+                panels = 1
+                if len(run_diffs):
+                    index = dr%len(run_diffs)
+                    if isinstance(run_diffs[index], tuple):
+                        panels = 2
+                        for box, text in zip(dual_text, run_diffs[index]):
+                            box.set_text(text)
+                        prefix = input_names[index].rstrip('.in')
+                        dual_boxes[0].set_title(prefix + ".ans \\<dim__>\\<green>(correct)\\<clear>")
+                        dual_boxes[1].set_title(prefix + ".out \\<dim__>\\<magen>(your output)\\<clear>")
+                if panels == 1 and not problem_box.visible:
+                    problem_box.set_visible(True)
+                    problem_box.update()
+                    textbox.update()
+                elif panels == 2 and problem_box.visible:
+                    problem_box.set_visible(False)
+                    for i in range(2):
+                        dual_boxes[i].update()
+                        dual_text[i].update()
+                if panels == 1:
+                    if len(run_diffs):
+                        index = dr%len(run_diffs)
+                        if run_diffs[index] is None:
+                            problem_box.set_title(f"{input_names[index]}.in queued" if run_status[index] == "queued" else f"{input_names[index]}.in running")
+                            textbox.set_text("")
+                        else:
+                            problem_box.set_title(f"Error running {input_names[index]}.in")
+                            textbox.set_text(run_diffs[index])
+            if problem_box.visible:
+                problem_box.update()
+                textbox.update()
+            else:
+                for i in range(2):
+                    dual_boxes[i].set_ratio((t-solve_time)/0.4-i*0.4)
+                    dual_text[i].update()
+        if view_state == "input":
+            if change_view_state:
+                problem_box.set_visible(True)
             problem_box.set_ratio((t-solve_time)/0.4)
             textbox.update()
+        if view_state == "running":
+            if change_view_state:
+                problem_box.set_visible(True)
+                if compile_error and last_used == "cpp" and not compiling:
+                    problem_box.set_title("Compile error")
+                    textbox.set_text(compile_error)
+                    textbox.update()
+                else:
+                    problem_box.set_title(f"Testing run.{last_used}" if not compiling else "Compiling run.cpp")
+                status_change = True
+            if status_change:
+                if run_processes:
+                    textbox.set_text('\n'.join(f"{input_names[i]}.in: {run_status[i]}" for i in range(len(run_processes))))
+
         option.update()
         if confirm:
             confirm_option.update()
@@ -303,8 +492,9 @@ def problem(problem_id):
                 for i in range(2):
                     dual_boxes[i].redraw()
                     dual_text[i].redraw()
-
+        change_view_state=False
         scr.refresh()
+    problem_id=''
 
 def main(screen):
     global state, scr, rows, cols, draw, cache

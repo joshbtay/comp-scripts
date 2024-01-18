@@ -1,0 +1,43 @@
+#!/bin/python
+from subprocess import *
+import requests
+from sys import argv
+from datetime import datetime, timedelta
+import os
+#TODO mkdirs
+
+print(0.0)
+#usage: aoc_downloader part year/day
+year,day = argv[2].split('/')
+part = argv[1]
+url = f"https://adventofcode.com/{year}/day/{day}/input"
+token = open("/home/taylor/code/comp-scripts/web-scripts/aoc_token")
+headers = {"Cookie": f'session={token.read().strip()}'}
+problem_dir = f"/home/taylor/code/aoc/{year}/{day}"
+
+if not os.path.isdir(problem_dir):
+    os.makedirs(problem_dir)
+if not os.path.isfile(problem_dir + "/1.in"):
+    r=requests.get(url, headers=headers)
+    if r.status_code == 200:
+        f=open(problem_dir + "/1.in", "wb")
+        f.write(r.content)
+if not os.path.isfile(problem_dir+"/run.py"):
+    f=open("/home/taylor/code/comp-scripts/templates/aoc.py")
+    out = open(problem_dir + "/run.py", 'w')
+    out.write(f.read())
+if not os.path.isfile(problem_dir+"/run.cpp"):
+    f=open("/home/taylor/code/comp-scripts/templates/base.cpp")
+    out = open(problem_dir + "/run.cpp", 'w')
+    out.write(f.read())
+
+process = Popen(["alacritty",  "-e", "/home/taylor/code/comp-scripts/web-scripts/aoc_grabber", str(year), str(day)],stdout=open('/dev/null', 'w'),stderr=open('/dev/null', 'w'), preexec_fn=os.setpgrp)
+
+Popen(["google-chrome-stable", f"https://adventofcode.com/{year}/day/{day}"],stdout=open('/dev/null', 'w'), stderr=open('/dev/null', 'w'))
+
+while True:
+    p = process.poll()
+    if p is not None:
+        break
+print(1.0)
+print("downloaded")

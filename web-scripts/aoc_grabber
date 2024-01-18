@@ -1,0 +1,74 @@
+#!/bin/python
+from curses import *
+import _curses
+import requests
+from sys import argv,path
+from bs4 import BeautifulSoup as bs
+import os
+path.append("/home/taylor/code/comp-scripts/window_utils/")
+from draw import *
+
+# usage: aoc_grabber year day
+year = argv[1]
+day = argv[2]
+token = open("/home/taylor/code/comp-scripts/web-scripts/aoc_token")
+headers = {"Cookie": f'session={token.read().strip()}'}
+
+def main(screen):
+    URL = f"https://adventofcode.com/{year}/day/{day}"
+    global scr
+    scr = screen
+    page = requests.get(URL, headers=headers)
+    soup = bs(page.content, "html.parser")
+    codes = soup.find_all("code")
+    scodes = sorted(codes,key=lambda x:-len(x.text))
+    j=0
+    screen.clear()
+    use_default_colors()
+    screen.scrollok(False)
+    draw = Draw(screen)
+    while True:
+        draw.drawstring(1,2,"is this the example input? y/n:", "default",bold=True)
+        for i,line in enumerate(scodes[j].text.split('\n')):
+            draw.drawstring(2+i,2,line,"default")
+        key=screen.getch()
+        if key==ord('y'):
+            screen.clear()
+            break
+        elif key==ord('n'):
+            j+=1
+            j%=len(codes)
+            screen.clear()
+        elif key==ord('q'):
+            quit()
+        screen.refresh()
+    k=len(codes)-1
+    while True:
+        draw.drawstring(1,2,"is this the example output? y/n:", "default",bold=True)
+        for i,line in enumerate(codes[k].text.split('\n')):
+            draw.drawstring(2+i,2,line,"default")
+        key=screen.getch()
+        if key==ord('y'):
+            screen.clear()
+            break
+        elif key==ord('n'):
+            k-=1
+            k%=len(codes)
+            screen.clear()
+        elif key==ord('q'):
+            quit()
+        screen.refresh()
+    out = open(problem_dir+"/0.in", "w")
+    out.write(scodes[j].text)
+    out = open(problem_dir+"/0.ans", "w")
+    out.write(codes[k].text)
+
+problem_dir = f"/home/taylor/code/aoc/{year}/{day}"
+os.chdir(problem_dir)
+try:
+    os.remove(problem_dir+"/0.in")
+    os.remove(problem_dir+"/0.ans")
+    os.remove(problem_dir+"/0.out")
+except OSError:
+    pass
+wrapper(main)

@@ -7,6 +7,19 @@ class BoxFrame(Widget):
         self.title = title
         self.subtitle = subtitle
         self.footer = footer
+        self.flags = {"red": "red",
+                       "yello": "yellow",
+                       "cyan": "cyan",
+                       "green": "green",
+                       "blue": "blue",
+                       "magen": "magenta",
+                       "white": "white",
+                       "black": "black",
+                       "bold": "bold",
+                       "itali": "italic",
+                       "under": "underline",
+                       "dim": "dim",
+                       }
     def _update(self):
         ratio = self.ratio
         x,y,xx,yy=self.get_dims()
@@ -46,8 +59,22 @@ class BoxFrame(Widget):
                 cy += yy-(i-xx*2-yy)-4
             self.draw.drawstring(cy,cx,c,self.color)
             self.buf += 1
-        self.draw.drawstring(y,x+2,self.title,self.color, bold=True)
-        self.draw.drawstring(y,x+3+len(self.title),self.subtitle,self.color)
+        j = 0
+        sub = 0
+        current_flags = set()
+        while j < len(self.title):
+            if j < len(self.title)-7 and self.title[j]=='\\' and self.title[j+1] == '<' and self.title[j+7] == '>':
+                key = self.title[j+2:j+7].rstrip('_')
+                if key == "clear":
+                    current_flags = set()
+                elif key in self.flags:
+                    current_flags.add(self.flags[key])
+                j+=8
+                sub += 8
+            else:
+                self.draw.formatted_string(y, x+2+j-sub, self.title[j], current_flags if current_flags else {self.color})
+                j+=1
+        self.draw.drawstring(y,x+3+len(self.title)-sub,self.subtitle,self.color)
         self.draw.drawstring(y+yy-1,x+xx-2-len(self.footer),self.footer,self.color)
     def _finish(self):
         self._update()
